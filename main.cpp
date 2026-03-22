@@ -152,6 +152,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove);
 
+    ImGui::TextDisabled("Version: %s", APP_VERSION);
+    ImGui::Separator();
+
     bool isConnected = g_wiimote.IsConnected();
     ImVec4 statusColor = isConnected
                              ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f)
