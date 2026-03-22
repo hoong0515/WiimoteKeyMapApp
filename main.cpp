@@ -13,6 +13,9 @@
 #include "ConfigManager.h"
 #include "Connection.h"
 #include "OutputRouter.h"
+// Must come after windows.h (pulled in via ConfigManager.h)
+#include <commctrl.h>
+#include <shellapi.h>
 
 // Data
 static ID3D11Device *g_pd3dDevice = nullptr;
@@ -26,6 +29,43 @@ void CleanupDeviceD3D();
 void CreateRenderTarget();
 void CleanupRenderTarget();
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+// Tray Icon Constants
+#define WM_TRAYICON (WM_USER + 1)
+#define ID_TRAY_APP_ICON 1001
+#define ID_TRAY_EXIT 5001
+#define ID_TRAY_OPEN 5002
+
+NOTIFYICONDATAW g_nid = {sizeof(g_nid)};
+bool g_WindowVisible = true;
+
+void AddTrayIcon(HWND hWnd) {
+  g_nid.hWnd = hWnd;
+  g_nid.uID = ID_TRAY_APP_ICON;
+  g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
+  g_nid.uCallbackMessage = WM_TRAYICON;
+  g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+  lstrcpyW(g_nid.szTip, L"WiimoteKeyMapApp");
+  lstrcpyW(g_nid.szInfo, L"WiimoteKeyMapApp is running in the background");
+  lstrcpyW(g_nid.szInfoTitle, L"Background Service");
+  Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+
+void RemoveTrayIcon() { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
+
+void ShowTrayContextMenu(HWND hWnd) {
+  POINT pt;
+  GetCursorPos(&pt);
+  HMENU hMenu = CreatePopupMenu();
+  InsertMenuW(hMenu, 0, MF_BYPOSITION | MF_STRING, ID_TRAY_OPEN,
+              L"Open WiimoteKeyMapApp");
+  InsertMenuW(hMenu, 1, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+  InsertMenuW(hMenu, 2, MF_BYPOSITION | MF_STRING, ID_TRAY_EXIT, L"Exit");
+
+  SetForegroundWindow(hWnd);
+  TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
+  DestroyMenu(hMenu);
+}
 
 // App State
 std::atomic<bool> g_appRunning{true};
@@ -72,12 +112,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   }).detach();
 
   // Create application window
-  WNDCLASSEXW wc = {sizeof(wc), CS_CLASSDC, WndProc,       0L,
-                    0L,         hInstance,  nullptr,       nullptr,
-                    nullptr,    nullptr,    L"WiimoteKeyMap UI", nullptr};
+  WNDCLASSEXW wc = {sizeof(wc),          CS_CLASSDC, WndProc, 0L,      0L,
+                    hInstance,           nullptr,    nullptr, nullptr, nullptr,
+                    L"WiimoteKeyMap UI", nullptr};
   ::RegisterClassExW(&wc);
   HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"WiimoteKeyMapApp",
-                              WS_OVERLAPPEDWINDOW, 100, 100, 620, 750, nullptr,
+                              WS_OVERLAPPEDWINDOW, 100, 100, 620, 770, nullptr,
                               nullptr, wc.hInstance, nullptr);
 
   if (!CreateDeviceD3D(hwnd)) {
@@ -88,6 +128,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   ::ShowWindow(hwnd, SW_SHOWDEFAULT);
   ::UpdateWindow(hwnd);
+
+  // Initialize System Tray
+  AddTrayIcon(hwnd);
 
   // Setup Dear ImGui context
   IMGUI_CHECKVERSION();
@@ -145,8 +188,41 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
+    // 0. Top Menu Bar
+    if (ImGui::BeginMainMenuBar()) {
+      if (ImGui::BeginMenu("Settings")) {
+        bool startup = ConfigManager::GetInstance().GetRunAtStartup();
+        if (ImGui::MenuItem("Run at Windows Startup", NULL, &startup)) {
+          ConfigManager::GetInstance().SetRunAtStartup(startup);
+        }
+        bool tray = ConfigManager::GetInstance().GetMinimizeToTray();
+        if (ImGui::MenuItem("Minimize to System Tray", NULL, &tray)) {
+          ConfigManager::GetInstance().SetMinimizeToTray(tray);
+        }
+        ImGui::EndMenu();
+      }
+      if (ImGui::BeginMenu("Profiles")) {
+        std::string current =
+            ConfigManager::GetInstance().GetCurrentProfileName();
+        ImGui::BeginDisabled();
+        ImGui::MenuItem(current.c_str(), NULL, true);
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Export Current Configuration")) {
+          ConfigManager::GetInstance().SaveProfile("Exported_" + current);
+        }
+        if (ImGui::MenuItem("Delete Current Profile", NULL, false,
+                            current != "default")) {
+          ConfigManager::GetInstance().DeleteProfile(current);
+          ConfigManager::GetInstance().LoadProfile("default");
+        }
+        ImGui::EndMenu();
+      }
+      ImGui::EndMainMenuBar();
+    }
+
     // 1. Connection Panel
-    ImGui::SetNextWindowPos(ImVec2(10, 10));
+    ImGui::SetNextWindowPos(ImVec2(10, 30));
     ImGui::SetNextWindowSize(ImVec2(580, 140));
     ImGui::Begin("Device Connection", nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
@@ -194,7 +270,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ImGui::End();
 
     // 2. Mapping Panel
-    ImGui::SetNextWindowPos(ImVec2(10, 160));
+    ImGui::SetNextWindowPos(ImVec2(10, 180));
     ImGui::SetNextWindowSize(ImVec2(580, 570));
     ImGui::Begin("Keyboard Mappings", nullptr,
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
@@ -508,6 +584,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   ImGui_ImplWin32_Shutdown();
   ImGui::DestroyContext();
 
+  RemoveTrayIcon();
+
   CleanupDeviceD3D();
   ::DestroyWindow(hwnd);
   ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
@@ -605,6 +683,32 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   case WM_SYSCOMMAND:
     if ((wParam & 0xfff0) == SC_KEYMENU)
       return 0; // Disable ALT app menu
+    if ((wParam & 0xfff0) == SC_MINIMIZE &&
+        ConfigManager::GetInstance().GetMinimizeToTray()) {
+      ::ShowWindow(hWnd, SW_HIDE);
+      g_WindowVisible = false;
+      return 0;
+    }
+    break;
+  case WM_TRAYICON:
+    if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
+      ::ShowWindow(hWnd, SW_SHOW);
+      ::ShowWindow(hWnd, SW_RESTORE);
+      ::SetForegroundWindow(hWnd);
+      g_WindowVisible = true;
+    } else if (LOWORD(lParam) == WM_RBUTTONUP) {
+      ShowTrayContextMenu(hWnd);
+    }
+    break;
+  case WM_COMMAND:
+    if (LOWORD(wParam) == ID_TRAY_OPEN) {
+      ::ShowWindow(hWnd, SW_SHOW);
+      ::ShowWindow(hWnd, SW_RESTORE);
+      ::SetForegroundWindow(hWnd);
+      g_WindowVisible = true;
+    } else if (LOWORD(wParam) == ID_TRAY_EXIT) {
+      ::PostQuitMessage(0);
+    }
     break;
   case WM_DESTROY:
     ::PostQuitMessage(0);

@@ -9,9 +9,7 @@
 - **Consolidated Dashboard (620x750)**: A unique, vertically stacked interface that provides a stable, "console-like" utility experience. 
 - **Dynamic Key Combinations**: Map single buttons to complex keyboard combinations (e.g., `Ctrl + Shift + T`).
 - **Mouse Button Emulation**: Dedicated dropdown for mapping buttons to Left, Right, or Middle mouse clicks.
-- **Human-Centric Mapping**: 
-  - **150ms Staggered Release Buffer**: Accurately captures full combinations even if fingers are released with slight delays.
-  - **Auto-Save Active Session**: All changes are instantly persisted to `active_config.json`.
+- **Auto-Save Active Session**: All changes are instantly persisted to `active_config.json`.
 - **Multi-Profile Management**: 
   - Load, Save (Export), and Delete custom mapping templates.
   - Separates your **Live Session** from your **Templates** to prevent accidental overrides.
