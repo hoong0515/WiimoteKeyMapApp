@@ -269,6 +269,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     static bool isReleaseBufferActive = false;
     static std::vector<WORD> bufferedKeys;
     static std::chrono::steady_clock::time_point releaseStartTime;
+    static std::vector<WORD> initialHeldKeys;
 
     if (ImGui::BeginTable("MappingTable", 4,
                           ImGuiTableFlags_RowBg |
@@ -314,7 +315,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         std::string mappingText = "";
         bool isThisRecording = (recordingButton == button);
         if (isThisRecording) {
-          mappingText = "[ Recording... ]";
+          if (recordedKeys.empty()) {
+            mappingText = "[ Recording... ]";
+          } else {
+            mappingText = "";
+            for (size_t i = 0; i < recordedKeys.size(); ++i) {
+              if (i > 0)
+                mappingText += "+";
+              mappingText +=
+                  ConfigManager::GetInstance().VKToString(recordedKeys[i]);
+            }
+          }
           ImGui::PushStyleColor(ImGuiCol_Button,
                                 ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
         } else {
@@ -336,6 +347,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             wasAnyKeyDown = false;
             isReleaseBufferActive = false;
             recordingStartTime = std::chrono::steady_clock::now();
+            initialHeldKeys.clear();
+            for (int i = 1; i < 256; ++i) {
+              if (GetAsyncKeyState(i) & 0x8000)
+                initialHeldKeys.push_back((WORD)i);
+            }
           }
         }
         if (isThisRecording)
@@ -377,11 +393,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     // Global key recording logic (Native Win32 Listener)
     if (!recordingButton.empty()) {
-      static bool wasAnyKeyDown = false;
-      static std::vector<WORD> bufferedKeys;
-      static std::chrono::steady_clock::time_point releaseStartTime;
-      static bool isReleaseBufferActive = false;
-
       std::vector<WORD> currentlyHeld;
       for (int i = 1; i < 256; ++i) {
         // Exclude mouse buttons
@@ -389,17 +400,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             i == VK_XBUTTON1 || i == VK_XBUTTON2)
           continue;
 
-        if (GetKeyState(i) & 0x8000) {
-          if (i == VK_SHIFT && ((GetKeyState(VK_LSHIFT) & 0x8000) ||
-                                (GetKeyState(VK_RSHIFT) & 0x8000)))
+        if (GetAsyncKeyState(i) & 0x8000) {
+          // Ignore keys that were already down when recording started until
+          // they are released
+          auto it = std::find(initialHeldKeys.begin(), initialHeldKeys.end(),
+                              (WORD)i);
+          if (it != initialHeldKeys.end())
             continue;
-          if (i == VK_CONTROL && ((GetKeyState(VK_LCONTROL) & 0x8000) ||
-                                  (GetKeyState(VK_RCONTROL) & 0x8000)))
+
+          // Skip generic modifiers to avoid duplicates and 'phantom' stuck
+          // states. We exclusively use L/R versions (LSHIFT, RSHIFT, etc.)
+          if (i == VK_SHIFT || i == VK_CONTROL || i == VK_MENU)
             continue;
-          if (i == VK_MENU && ((GetKeyState(VK_LMENU) & 0x8000) ||
-                               (GetKeyState(VK_RMENU) & 0x8000)))
-            continue;
+
           currentlyHeld.push_back((WORD)i);
+        } else {
+          // Once released, remove from initial skip list
+          auto it = std::find(initialHeldKeys.begin(), initialHeldKeys.end(),
+                              (WORD)i);
+          if (it != initialHeldKeys.end())
+            initialHeldKeys.erase(it);
         }
       }
 
