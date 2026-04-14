@@ -17,6 +17,8 @@
 #include <commctrl.h>
 #include <shellapi.h>
 
+#include "resource.h"
+
 // Data
 static ID3D11Device *g_pd3dDevice = nullptr;
 static ID3D11DeviceContext *g_pd3dDeviceContext = nullptr;
@@ -40,11 +42,13 @@ NOTIFYICONDATAW g_nid = {sizeof(g_nid)};
 bool g_WindowVisible = true;
 
 void AddTrayIcon(HWND hWnd) {
+  g_nid.cbSize = sizeof(NOTIFYICONDATAW);
+
   g_nid.hWnd = hWnd;
   g_nid.uID = ID_TRAY_APP_ICON;
   g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
   g_nid.uCallbackMessage = WM_TRAYICON;
-  g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+  g_nid.hIcon = LoadIconW(GetModuleHandle(NULL), MAKEINTRESOURCEW(IDI_ICON1));
   lstrcpyW(g_nid.szTip, L"WiimoteKeyMapApp");
   Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
@@ -160,6 +164,20 @@ void ScanTask() {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                     PWSTR pCmdLine, int nCmdShow) {
+
+  int argc;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+  bool startMinimized = false;if (argv != NULL) {
+        for (int i = 1; i < argc; i++) {
+            // --background 또는 -b 옵션 확인
+            if (wcscmp(argv[i], L"--background") == 0 || wcscmp(argv[i], L"-b") == 0) {
+                startMinimized = true;
+            }
+        }
+        LocalFree(argv); // 사용 후 메모리 해제
+    }
+
   // ConfigManager Load (Loads the last active session)
   ConfigManager::GetInstance().LoadActiveConfig();
 
@@ -178,7 +196,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     return 1;
   }
 
-  ::ShowWindow(hwnd, SW_SHOWDEFAULT);
+  if (startMinimized) {
+    g_WindowVisible = false;
+    ::ShowWindow(hwnd, SW_HIDE);
+  } else {
+    g_WindowVisible = true;
+    ::ShowWindow(hwnd, SW_SHOWDEFAULT);
+  }
+
+  
   ::UpdateWindow(hwnd);
 
   // Initialize System Tray
@@ -256,13 +282,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     // 0. Top Menu Bar
     if (ImGui::BeginMainMenuBar()) {
-      if (ImGui::BeginMenu("Settings")) {
-        bool tray = ConfigManager::GetInstance().GetMinimizeToTray();
-        if (ImGui::MenuItem("Minimize to System Tray", NULL, &tray)) {
-          ConfigManager::GetInstance().SetMinimizeToTray(tray);
-        }
-        ImGui::EndMenu();
-      }
       if (ImGui::BeginMenu("Profiles")) {
         std::string current =
             ConfigManager::GetInstance().GetCurrentProfileName();
