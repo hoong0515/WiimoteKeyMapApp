@@ -21,5 +21,4 @@ active_config.json
 profiles/!default.json
 
 # System Files
-.DS_Store
-Thumbs.db
+
