@@ -42,16 +42,58 @@ bool g_WindowVisible = true;
 void AddTrayIcon(HWND hWnd) {
   g_nid.hWnd = hWnd;
   g_nid.uID = ID_TRAY_APP_ICON;
-  g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
+  g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
   g_nid.uCallbackMessage = WM_TRAYICON;
   g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
   lstrcpyW(g_nid.szTip, L"WiimoteKeyMapApp");
-  lstrcpyW(g_nid.szInfo, L"WiimoteKeyMapApp is running in the background");
-  lstrcpyW(g_nid.szInfoTitle, L"Background Service");
   Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
 
 void RemoveTrayIcon() { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
+
+// How long (ms) each balloon notification stays visible before being cleared.
+static constexpr int kNotificationDisplayMs = 3000;
+
+// Generation counter — incremented on each new notification so that the
+// dismissal timer for an older notification does not clear a newer one.
+static std::atomic<int> g_notifGeneration{0};
+
+// Show a balloon notification via the system tray icon.
+// Dismisses any currently visible balloon before showing the new one.
+// Automatically dismissed after kNotificationDisplayMs.
+// Safe to call from any thread.
+void ShowNotification(const wchar_t *title, const wchar_t *message) {
+  // Dismiss any existing balloon first so the new one appears immediately.
+  NOTIFYICONDATAW clearNid = g_nid;
+  clearNid.uFlags          = NIF_INFO;
+  clearNid.dwInfoFlags     = NIIF_INFO;
+  clearNid.szInfoTitle[0]  = L'\0';
+  clearNid.szInfo[0]       = L'\0';
+  Shell_NotifyIconW(NIM_MODIFY, &clearNid);
+
+  NOTIFYICONDATAW nid  = g_nid;
+  nid.uFlags           = NIF_INFO;
+  nid.dwInfoFlags      = NIIF_INFO;
+  lstrcpyW(nid.szInfoTitle, title);
+  lstrcpyW(nid.szInfo, message);
+  Shell_NotifyIconW(NIM_MODIFY, &nid);
+
+  // Schedule balloon dismissal.  The generation check ensures that if a
+  // second notification fires before the timer expires, the first timer
+  // does not wipe out the newer balloon.
+  int gen = ++g_notifGeneration;
+  std::thread([gen]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(kNotificationDisplayMs));
+    if (g_notifGeneration.load() == gen) {
+      NOTIFYICONDATAW clearNid = g_nid;
+      clearNid.uFlags          = NIF_INFO;
+      clearNid.dwInfoFlags     = NIIF_INFO;
+      clearNid.szInfoTitle[0]  = L'\0';
+      clearNid.szInfo[0]       = L'\0';
+      Shell_NotifyIconW(NIM_MODIFY, &clearNid);
+    }
+  }).detach();
+}
 
 void ShowTrayContextMenu(HWND hWnd) {
   POINT pt;
@@ -74,42 +116,52 @@ Connection g_wiimote;
 OutputRouter g_router;
 
 void BackgroundTask() {
-  // Background routing loop
+  // Responsible only for input routing and passive reconnection.
+  // BT discovery is handled by ScanTask.
   while (g_appRunning) {
-    if (!g_isSearching) {
-      if (g_wiimote.IsConnected()) {
-        const WiiRemoteState &state = g_wiimote.GetState();
-        g_router.Route(state);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      } else {
-        g_router.Reset();
-        g_wiimote.PassiveConnect();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      }
+    if (g_wiimote.IsConnected()) {
+      const WiiRemoteState &state = g_wiimote.GetState();
+      g_router.Route(state);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } else {
+      g_router.Reset();
+      // Poll the HID device list every 500 ms.  ScanTask enables HID service
+      // when a remote is found; PassiveConnect picks it up here.
+      g_wiimote.PassiveConnect();
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+  }
+}
+
+void ScanTask() {
+  // Continuously scans for Wii Remotes via BT inquiry while not connected.
+  // Each ScanOnce() call issues one ~2.56 s inquiry and returns immediately
+  // after — giving truly gapless coverage without a fixed polling interval.
+  bool stalePairingsRemoved = false;
+
+  while (g_appRunning) {
+    if (!g_wiimote.IsConnected()) {
+      // On the first cycle after a disconnect, remove stale BT pairings so
+      // a fresh SYNC press is visible to the inquiry as an unknown device.
+      if (!stalePairingsRemoved) {
+        g_wiimote.RemoveStalePairings();
+        stalePairingsRemoved = true;
+      }
+      g_isSearching.store(true);
+      g_wiimote.ScanOnce(); // ~2.56 s, then restart immediately
+    } else {
+      stalePairingsRemoved = false; // reset for the next disconnect
+      g_isSearching.store(false);
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
+  g_isSearching.store(false);
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                     PWSTR pCmdLine, int nCmdShow) {
   // ConfigManager Load (Loads the last active session)
   ConfigManager::GetInstance().LoadActiveConfig();
-
-  // Spawn router thread which also handles background passive device mounting
-  std::thread bgThread(BackgroundTask);
-
-  // Automated Startup Flow:
-  // 1. Check existing HID list (passive)
-  // 2. If not found, start a full Bluetooth scan (active)
-  std::thread([]() {
-    if (!g_wiimote.PassiveConnect()) {
-      g_isSearching.store(true);
-      g_wiimote.ActiveSearchConnect();
-      g_isSearching.store(false);
-    }
-  }).detach();
 
   // Create application window
   WNDCLASSEXW wc = {sizeof(wc),          CS_CLASSDC, WndProc, 0L,      0L,
@@ -131,6 +183,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
   // Initialize System Tray
   AddTrayIcon(hwnd);
+
+  // Register connect/disconnect notifications.
+  // Callbacks are set after AddTrayIcon so g_nid is ready before they fire.
+  g_wiimote.SetOnConnected([]() {
+    ShowNotification(L"Wii Remote Connected", L"Wii Remote Connected.");
+  });
+  g_wiimote.SetOnDisconnected([]() {
+    ShowNotification(L"Wii Remote Disconnected", L"Wii Remote Disconnected.");
+  });
+
+  // bgThread: input routing + passive HID reconnection
+  // scanThread: continuous BT inquiry (ScanOnce loop)
+  std::thread bgThread(BackgroundTask);
+  std::thread scanThread(ScanTask);
 
   // Setup Dear ImGui context
   IMGUI_CHECKVERSION();
@@ -191,10 +257,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     // 0. Top Menu Bar
     if (ImGui::BeginMainMenuBar()) {
       if (ImGui::BeginMenu("Settings")) {
-        bool startup = ConfigManager::GetInstance().GetRunAtStartup();
-        if (ImGui::MenuItem("Run at Windows Startup", NULL, &startup)) {
-          ConfigManager::GetInstance().SetRunAtStartup(startup);
-        }
         bool tray = ConfigManager::GetInstance().GetMinimizeToTray();
         if (ImGui::MenuItem("Minimize to System Tray", NULL, &tray)) {
           ConfigManager::GetInstance().SetMinimizeToTray(tray);
@@ -232,10 +294,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ImGui::Separator();
 
     bool isConnected = g_wiimote.IsConnected();
-    ImVec4 statusColor = isConnected
-                             ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f)
-                             : (g_isSearching ? ImVec4(1.0f, 0.8f, 0.0f, 1.0f)
-                                              : ImVec4(1.0f, 0.2f, 0.2f, 1.0f));
+    ImVec4 statusColor = isConnected ? ImVec4(0.2f, 1.0f, 0.2f, 1.0f)
+                                     : ImVec4(1.0f, 0.8f, 0.0f, 1.0f);
 
     // Status LED
     ImGui::TextUnformatted("Status:");
@@ -247,12 +307,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ImGui::Dummy(ImVec2(20, 16));
     ImGui::SameLine();
 
-    if (g_isSearching) {
-      ImGui::TextColored(statusColor, "SCANNING... (Hold SYNC on Wiimote)");
-    } else if (isConnected) {
+    if (isConnected) {
       ImGui::TextColored(statusColor, "CONNECTED");
     } else {
-      ImGui::TextColored(statusColor, "DISCONNECTED");
+      ImGui::TextColored(statusColor, "SCANNING... (Hold SYNC on Wiimote)");
     }
 
     ImGui::Separator();
@@ -579,6 +637,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   // Cleanup
   g_appRunning = false;
   bgThread.join();
+  scanThread.join();
 
   ImGui_ImplDX11_Shutdown();
   ImGui_ImplWin32_Shutdown();
@@ -687,6 +746,9 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ConfigManager::GetInstance().GetMinimizeToTray()) {
       ::ShowWindow(hWnd, SW_HIDE);
       g_WindowVisible = false;
+      ShowNotification(L"WiimoteKeyMapApp",
+                       L"Running in background. "
+                       L"Double-click the tray icon to restore.");
       return 0;
     }
     break;
@@ -710,6 +772,15 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       ::PostQuitMessage(0);
     }
     break;
+  case WM_CLOSE:
+    // X button: hide to tray instead of exiting.
+    // The user can exit via the tray context menu.
+    ::ShowWindow(hWnd, SW_HIDE);
+    g_WindowVisible = false;
+    ShowNotification(L"WiimoteKeyMapApp",
+                     L"Running in the background. "
+                     L"Double-click the tray icon to restore.");
+    return 0;
   case WM_DESTROY:
     ::PostQuitMessage(0);
     return 0;

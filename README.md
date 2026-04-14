@@ -1,81 +1,108 @@
 # WiimoteKeyMapApp
 
-**WiimoteKeyMapApp** is a high-performance, professional utility for Windows that translates Wii Remote (Wiimote) inputs into precise Keyboard and Mouse actions. It features a modern, consolidated dashboard and an advanced mapping engine designed for responsiveness and reliability.
+**WiimoteKeyMapApp** is a Windows utility that connects a Wii Remote via Bluetooth and maps its buttons to keyboard and mouse inputs. It features continuous automatic scanning, system tray integration, and a modern ImGui-based dashboard.
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
-- **Consolidated Dashboard (620x750)**: A unique, vertically stacked interface that provides a stable, "console-like" utility experience. 
-- **Dynamic Key Combinations**: Map single buttons to complex keyboard combinations (e.g., `Ctrl + Shift + T`).
-- **Mouse Button Emulation**: Dedicated dropdown for mapping buttons to Left, Right, or Middle mouse clicks.
-- **Auto-Save Active Session**: All changes are instantly persisted to `active_config.json`.
-- **Multi-Profile Management**: 
-  - Load, Save (Export), and Delete custom mapping templates.
-  - Separates your **Live Session** from your **Templates** to prevent accidental overrides.
-- **Sleek UI**: Built with a premium dark-mode theme utilizing **Dear ImGui** and **DirectX 11**.
+- **Continuous Auto-Scanning**: Automatically and continuously searches for Wii Remotes in the background — no manual triggering required. Just press SYNC and the app picks it up.
+- **Reliable Connection Detection**:
+  - Stale HID entry detection via a liveness write check before declaring a connection live
+  - 500 ms stabilization period — requires continuous HID reports before confirming a connection
+  - Fast disconnect detection via I/O error signaling from the read thread (Dolphin-style)
+  - 1-second watchdog timeout for silent disconnects
+- **Dynamic Key Combinations**: Map buttons to complex keyboard combos (e.g., `Ctrl + Shift + T`)
+- **Mouse Button Emulation**: Dedicated dropdown for Left, Right, or Middle mouse clicks
+- **System Tray Integration**:
+  - Closing or minimizing the window hides it to the system tray
+  - Double-click the tray icon to restore the window
+  - Right-click tray context menu (Open / Exit)
+  - Balloon notifications on connect/disconnect, auto-dismissed after 3 seconds
+- **Multi-Profile Management**: Load, export, and delete custom mapping templates stored as `.json` files
+- **Auto-Save**: All changes are instantly persisted to `active_config.json`
+- **Sleek UI**: Premium dark-mode theme built with Dear ImGui + DirectX 11
 
 ---
 
-## 🛠️ How to Use
+## How to Use
 
 ### 1. Connecting
-- Click the **"Search & Connect"** button. 
-- Hold the **SYNC** button on your Wii Remote.
-- The **Status LED** will turn Green when connected.
+- The app scans for Wii Remotes **automatically** in the background.
+- Press the **SYNC** button on your Wii Remote.
+- The status indicator turns **green** (CONNECTED) once a stable connection is confirmed.
+- While scanning, the status shows **yellow** (SCANNING...).
+- The **"Search & Connect"** button triggers an immediate manual scan if needed.
 
 ### 2. Mapping Buttons
-- **Keyboard**: Click an "Assignment" button in the table. While it says "Recording...", hold down your desired keys. Release them all at once to save.
-- **Mouse**: Select a click action from the "Action Mode" dropdown.
-- **Clear**: Click the small **"X"** on the far-left of any row.
+- **Keyboard**: Click an "Assignment" button in the table. While it shows `[ Recording... ]`, hold your desired keys and release them all to save.
+- **Mouse**: Select a click action from the "Action Mode" dropdown (`M-Left`, `M-Right`, `M-Mid`).
+- **Clear**: Click the **"X"** button on the left of any row.
 
-### 3. Profiles
-- **Exporting**: Type a name in the "Save Current As" field and click **"Export Profile"** to create a template.
-- **Internal Storage**: Templates are stored as `.json` files in the `profiles/` directory for easy sharing.
+### 3. System Tray
+- Closing (`X`) or minimizing the window hides it to the system tray — the app keeps running.
+- **Double-click** the tray icon to restore the window.
+- **Right-click** the tray icon for Open / Exit options.
+- "Minimize to System Tray" behavior can be toggled under **Settings**.
+
+### 4. Profiles
+- Type a name in "Save Current As" and click **"Export Profile"** to save the current mappings as a template.
+- Select a profile from the "Active Template" dropdown to load it.
+- Templates are stored as `.json` files in the `profiles/` directory.
 
 ---
 
-## 💻 Technical details
+## Technical Details
 
 - **Language**: C++20
-- **Build System**: CMake (FetchContent used for dependencies)
-- **GUI Framework**: Dear ImGui (v1.90.4)
-- **Rendering**: DirectX 11
-- **Configuration**: JSON (powered by `nlohmann/json`)
-- **API**: Windows Bluetooth HID and `SendInput` for low-level emulation.
+- **Build System**: CMake (FetchContent for dependencies)
+- **GUI Framework**: Dear ImGui (v1.90.4) + DirectX 11
+- **Configuration**: JSON via `nlohmann/json`
+- **APIs**: Windows Bluetooth HID (`bluetoothapis.h`, `hidsdi.h`, `setupapi.h`), `SendInput` for input emulation
+
+### Connection Architecture
+
+Two dedicated background threads handle connection management independently:
+
+| Thread | Responsibility |
+|--------|----------------|
+| `ScanTask` | Continuous BT inquiry loop (~2.56 s per cycle via `BluetoothFindFirstDevice` with `issueInquiry`). Removes stale BT pairings once per disconnect session so fresh SYNC presses are visible as unknown devices. |
+| `BackgroundTask` | Input routing via `SendInput` + passive HID reconnection polling every 500 ms. Picks up a device as soon as `ScanTask` enables its HID service. |
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
-- `main.cpp`: Core application loop and UI logic.
-- `ConfigManager.cpp/h`: Manages profile loading, persistent storage, and key conversions.
-- `Connection.cpp/h`: Handles Bluetooth HID device discovery and report handling.
-- `InputNormalizer.cpp/h`: Parses raw HID reports into structured state data.
-- `OutputRouter.cpp/h`: Translates state data into physical Windows input events.
-
----
-
-## 🏗️ Build Instructions
-
-1. **Requirements**: 
-   - Windows 10/11.
-   - Visual Studio 2022 (with C++20 support).
-   - CMake 3.20+.
-2. **Steps**:
-   ```bash
-   mkdir build
-   cd build
-   cmake ..
-   cmake --build . --config Release
-   ```
+```
+main.cpp              — Application loop, UI rendering, system tray, background threads
+Connection.cpp/h      — Bluetooth HID discovery, overlapped read loop, connection lifecycle
+InputNormalizer.cpp/h — Parses raw HID reports into structured WiiRemoteState
+OutputRouter.cpp/h    — Translates WiiRemoteState into SendInput keyboard/mouse events
+ConfigManager.cpp/h   — Profile storage, key mapping persistence, VK↔string conversion
+```
 
 ---
 
-## 🌟 Acknowledgements
+## Build Instructions
 
-- [Dear ImGui](https://github.com/ocornut/imgui) for the incredible UI framework.
-- [nlohmann/json](https://github.com/nlohmann/json) for the elegant JSON library.
+**Requirements**: Windows 10/11, Visual Studio 2022 (C++20), CMake 3.20+
+
+```bash
+mkdir build
+cd build
+cmake ..
+cmake --build . --config Release
+```
+
+The executable is placed in `build/Release/WiimoteKeyMapApp.exe`. Run it directly — no installer required.
 
 ---
-*Created with the focus on enhancing the Wii Remote's utility in modern desktop workflows.*
+
+## Acknowledgements
+
+- [Dear ImGui](https://github.com/ocornut/imgui) — Immediate-mode UI framework
+- [nlohmann/json](https://github.com/nlohmann/json) — JSON library
+
+---
+
+*Designed to make the Wii Remote a reliable input device for modern Windows workflows.*

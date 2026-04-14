@@ -33,15 +33,26 @@ bool Connection::PassiveConnect() {
     return false;
   }
 
-  std::cout << "Successfully connected passively to Wii Remote." << std::endl;
-  
   // Reset the report watchdog early to avoid raced timeouts during Sleep
   m_lastReportTime = std::chrono::steady_clock::now();
 
-  // Trigger LED and Haptic Feedback
-  SetLEDsAndRumble(true, true);  // LED1 On, Rumble On
-  Sleep(150);                    // Wait 150ms
+  // Liveness check: attempt a write before declaring the connection live.
+  // When Windows retains a stale HID entry after the remote powers off,
+  // CreateFileW still succeeds but WriteFile fails immediately with
+  // ERROR_DEVICE_NOT_CONNECTED.  Catching that here prevents a false
+  // "connected" state that would only be corrected seconds later by the
+  // watchdog or ReadLoop exit.
+  if (!SetLEDsAndRumble(true, true)) {
+    std::cerr << "Device path found but write failed (stale HID entry). "
+                 "Error: " << GetLastError() << std::endl;
+    CloseHandle(m_deviceHandle);
+    m_deviceHandle = INVALID_HANDLE_VALUE;
+    return false;
+  }
+  Sleep(150);
   SetLEDsAndRumble(true, false); // LED1 On, Rumble Off
+
+  std::cout << "Successfully connected to Wii Remote." << std::endl;
 
   UCHAR reportMode[22] = {0};
   reportMode[0] = 0x12; // Report mode config
@@ -50,10 +61,15 @@ bool Connection::PassiveConnect() {
   WriteReport(reportMode, sizeof(reportMode));
 
   // Now declare the connection fully initialized and running
+  m_readLoopExited = false;
+  m_connectionConfirmed = false;
+  m_connectionStartTime = std::chrono::steady_clock::now();
   m_connected = true;
   m_shouldStop = false;
 
-  // Start read thread
+  // Start read thread.
+  // m_onConnected is NOT called here — it fires from ReadLoop after
+  // kStabilizationMs of continuous incoming reports (see ReadLoop).
   m_readThread = std::thread(&Connection::ReadLoop, this);
 
   return true;
@@ -107,9 +123,9 @@ bool Connection::WriteReport(UCHAR *buffer, size_t size) {
   return res == TRUE;
 }
 
-void Connection::SetLEDsAndRumble(bool led1, bool rumble) {
+bool Connection::SetLEDsAndRumble(bool led1, bool rumble) {
   if (m_deviceHandle == INVALID_HANDLE_VALUE)
-    return;
+    return false;
 
   UCHAR buf[22] = {0}; // Wiimote output reports must be exactly 22 bytes
   buf[0] = 0x11;       // Report ID 0x11: Player LEDs
@@ -122,14 +138,19 @@ void Connection::SetLEDsAndRumble(bool led1, bool rumble) {
 
   buf[1] = data;
 
-  WriteReport(buf, sizeof(buf));
+  return WriteReport(buf, sizeof(buf));
 }
 
 void Connection::Disconnect() {
   std::lock_guard<std::recursive_mutex> lock(m_connectionMutex);
   bool expected = true;
   if (m_connected.compare_exchange_strong(expected, false)) {
+    // Capture confirmation state before resetting so we can decide whether
+    // to fire m_onDisconnected below.
+    const bool wasConfirmed = m_connectionConfirmed.exchange(false);
+
     m_shouldStop = true;
+    m_readLoopExited = false; // Reset for the next connection
 
     // Unblock any pending I/O by cancelling it or closing handle
     if (m_deviceHandle != INVALID_HANDLE_VALUE) {
@@ -148,22 +169,32 @@ void Connection::Disconnect() {
     }
 
     std::cout << "Disconnected from Wii Remote." << std::endl;
+
+    // Only notify if the connection was actually confirmed as stable.
+    // A stale HID entry that never delivered reports never set wasConfirmed,
+    // so it produces neither a connected nor a disconnected notification.
+    if (wasConfirmed && m_onDisconnected) m_onDisconnected();
   }
 }
 
 bool Connection::IsConnected() const {
   if (m_connected) {
+    // Fast path: the read loop exited due to an I/O error (not a graceful stop).
+    // Dolphin-style: detect failure immediately from the I/O thread signal
+    // rather than waiting for the watchdog timer to expire.
+    if (m_readLoopExited) {
+      const_cast<Connection *>(this)->Disconnect();
+      return false;
+    }
+
+    // Watchdog: if no HID report has arrived for 1 seconds the device has
+    // powered off or gone out of range.  1s is generous enough to avoid
+    // false-positives during report-mode transitions while still catching a
+    // switched-off remote quickly.
     auto now = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(
         now - m_lastReportTime.load());
-
-    // If we haven't received a report in 1 second, assume the device powered
-    // off.
     if (duration.count() > 1) {
-      // Can't call Disconnect() directly from const method easily without
-      // mutable trickery, but returning false alerts the external loops to
-      // trigger reconnect. We cast away const specifically to drop the dead
-      // connection safely via Disconnect.
       const_cast<Connection *>(this)->Disconnect();
       return false;
     }
@@ -175,83 +206,66 @@ const WiiRemoteState &Connection::GetState() const {
   return m_normalizer.GetState();
 }
 
-bool Connection::AutoConnectBluetooth() {
-  // 1. Clear any remembered Wii Remotes to ensure a fresh connection state
-  BLUETOOTH_DEVICE_SEARCH_PARAMS searchParams = {
+void Connection::RemoveStalePairings() {
+  // Query the BT database (no inquiry) for remembered/authenticated Wii
+  // Remotes and remove them so that a fresh SYNC press is seen as unknown.
+  BLUETOOTH_DEVICE_SEARCH_PARAMS sp = {
       sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS),
-      1,   // returnAuthenticated
-      1,   // returnRemembered
-      0,   // returnUnknown
-      1,   // returnConnected
-      0,   // issueInquiry
-      2,   // timeoutMultiplier
-      NULL // hRadio
+      1, 1, 0, 1, // returnAuthenticated, returnRemembered, returnUnknown=0, returnConnected
+      0,          // issueInquiry = false (fast, no radio scan)
+      2, NULL
   };
-
-  BLUETOOTH_DEVICE_INFO deviceInfo = {sizeof(BLUETOOTH_DEVICE_INFO)};
-  HBLUETOOTH_DEVICE_FIND hFind =
-      BluetoothFindFirstDevice(&searchParams, &deviceInfo);
+  BLUETOOTH_DEVICE_INFO di = {sizeof(BLUETOOTH_DEVICE_INFO)};
+  HBLUETOOTH_DEVICE_FIND hFind = BluetoothFindFirstDevice(&sp, &di);
   if (hFind) {
     do {
-      std::wstring name = deviceInfo.szName;
-      if (name.find(L"Nintendo RVL-CNT-01") != std::wstring::npos) {
-        std::wcout << L"Removing stale Wii Remote profile: " << name
-                   << std::endl;
-        BluetoothRemoveDevice(&deviceInfo.Address);
+      if (std::wstring(di.szName).find(L"Nintendo RVL-CNT-01") != std::wstring::npos) {
+        std::wcout << L"Removing stale Wii Remote profile: " << di.szName << std::endl;
+        BluetoothRemoveDevice(&di.Address);
       }
-    } while (BluetoothFindNextDevice(hFind, &deviceInfo));
+    } while (BluetoothFindNextDevice(hFind, &di));
     BluetoothFindDeviceClose(hFind);
   }
+}
 
-  // 2. Search for unknown/new Wii Remotes exactly like the legacy
-  // implementation
-  searchParams.fReturnAuthenticated = 0;
-  searchParams.fReturnRemembered = 0;
-  searchParams.fReturnConnected = 0;
-  searchParams.fReturnUnknown = 1;
-  searchParams.fIssueInquiry = 1;
-  searchParams.cTimeoutMultiplier = 4; // ~5.12 seconds timeout (was 19s)
-
-  std::cout << ">>> PRESS THE RED SYNC BUTTON ON THE WII REMOTE NOW <<<"
-            << std::endl;
-  std::cout << "Scanning for unknown Wii Remotes over Bluetooth (Timeout: ~5 "
-               "seconds)..."
-            << std::endl;
-
-  hFind = BluetoothFindFirstDevice(&searchParams, &deviceInfo);
-  if (!hFind) {
-    std::cout << "No Wii Remote found during scan." << std::endl;
+bool Connection::ScanOnce() {
+  // Single BT inquiry cycle (~2.56 s).  Only looks for unknown (unpaired)
+  // devices — the opposite of PassiveConnect which relies on the HID list.
+  // Safe to call from any thread without holding m_connectionMutex.
+  BLUETOOTH_DEVICE_SEARCH_PARAMS sp = {
+      sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS),
+      0, 0, 1, 0, // returnUnknown only
+      1,          // issueInquiry
+      2,          // cTimeoutMultiplier — 2 × 1.28 s ≈ 2.56 s per cycle
+      NULL
+  };
+  BLUETOOTH_DEVICE_INFO di = {sizeof(BLUETOOTH_DEVICE_INFO)};
+  HBLUETOOTH_DEVICE_FIND hFind = BluetoothFindFirstDevice(&sp, &di);
+  if (!hFind)
     return false;
-  }
 
   bool found = false;
   do {
-    std::wstring name = deviceInfo.szName;
-    if (name.find(L"Nintendo RVL-CNT-01") != std::wstring::npos) {
-      std::wcout << L"Found Wii Remote via Bluetooth: " << name << std::endl;
-
-      // 3. Connect by enabling HID service directly, bypassing explicit PIN
-      // prompts (matches legacy DLL)
+    if (std::wstring(di.szName).find(L"Nintendo RVL-CNT-01") != std::wstring::npos) {
+      std::wcout << L"Wii Remote found via continuous scan: " << di.szName << std::endl;
       GUID hidGuid = HumanInterfaceDeviceServiceClass_UUID;
-      std::cout << "Enabling HID Service (this bypasses manual PIN pairing)..."
-                << std::endl;
-      DWORD serviceResult = BluetoothSetServiceState(
-          NULL, &deviceInfo, &hidGuid, BLUETOOTH_SERVICE_ENABLE);
-
-      if (serviceResult == ERROR_SUCCESS) {
-        std::cout << "HID service enabled successfully. Device is paired!"
-                  << std::endl;
+      if (BluetoothSetServiceState(NULL, &di, &hidGuid, BLUETOOTH_SERVICE_ENABLE) == ERROR_SUCCESS) {
+        std::cout << "HID service enabled." << std::endl;
         found = true;
-      } else {
-        std::cerr << "Failed to enable HID service manually. Error Code: "
-                  << serviceResult << std::endl;
       }
       break;
     }
-  } while (BluetoothFindNextDevice(hFind, &deviceInfo));
+  } while (BluetoothFindNextDevice(hFind, &di));
 
   BluetoothFindDeviceClose(hFind);
   return found;
+}
+
+bool Connection::AutoConnectBluetooth() {
+  // Used by the manual "Search & Connect" path: clean up stale pairings
+  // first, then run a single (longer) inquiry cycle.
+  RemoveStalePairings();
+  return ScanOnce();
 }
 
 std::wstring Connection::FindWiimoteDevicePath() {
@@ -362,13 +376,29 @@ void Connection::ReadLoop() {
 
     if (bytesRead > 0) {
       m_lastReportTime = std::chrono::steady_clock::now();
-      if (m_normalizer.ParseReport(reportBuffer, bytesRead)) {
-        // State successfully updated
+
+      // Stabilization check: promote to "confirmed" once kStabilizationMs of
+      // continuous reports have arrived.  Stale HID entries never reach this
+      // point because their ReadFile fails before any report is delivered.
+      if (!m_connectionConfirmed) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            m_lastReportTime.load() - m_connectionStartTime.load()).count();
+        if (elapsed >= kStabilizationMs) {
+          m_connectionConfirmed = true;
+          if (m_onConnected) m_onConnected();
+        }
       }
+
+      m_normalizer.ParseReport(reportBuffer, bytesRead);
     }
   }
 
   CloseHandle(overlapped.hEvent);
-  // Explicitly do not touch m_connected here, let Disconnect handle it
-  // perfectly
+
+  // If we exited due to an unexpected I/O error (not because Disconnect() set
+  // m_shouldStop), signal IsConnected() so it can call Disconnect() immediately
+  // without waiting for the watchdog timeout.
+  if (!m_shouldStop) {
+    m_readLoopExited = true;
+  }
 }

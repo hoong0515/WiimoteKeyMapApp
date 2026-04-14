@@ -1,7 +1,0 @@
-﻿int __declspec(dllexport) __stdcall TinyBT_check_parent(void);
-int __declspec(dllexport) __stdcall TinyBT_check_wii_remote_connected(void);
-int __declspec(dllexport) __stdcall TinyBT_close_wii_remote(void);
-int __declspec(dllexport) __stdcall TinyBT_clear_remembered_wii_remote(void);
-int __declspec(dllexport) __stdcall TinyBT_search_wii_remote(void);
-int __declspec(dllexport) __stdcall TinyBT_start_wii_remote_hid_service(void);
-int __declspec(dllexport) __stdcall TinyBT_finish(void);

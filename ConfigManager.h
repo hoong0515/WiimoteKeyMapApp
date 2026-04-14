@@ -19,8 +19,6 @@ public:
     void LoadProfile(const std::string& profileName);   // Loads profile into active config
     void SaveProfile(const std::string& profileName);   // Exports active config to a profile
     
-    bool GetRunAtStartup() const { return m_runAtStartup; }
-    void SetRunAtStartup(bool enable);
     bool GetMinimizeToTray() const { return m_minimizeToTray; }
     void SetMinimizeToTray(bool enable);
 
@@ -41,7 +39,6 @@ private:
     ConfigManager();
     ~ConfigManager() = default;
 
-    bool m_runAtStartup = false;
     bool m_minimizeToTray = true;
     std::map<std::string, std::vector<WORD>> m_mappings;
     std::string m_loadedProfileName = "default";

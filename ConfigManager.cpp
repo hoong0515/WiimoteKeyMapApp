@@ -68,9 +68,6 @@ void ConfigManager::LoadActiveConfig() {
     if (j.contains("last_profile")) {
       m_loadedProfileName = j["last_profile"].get<std::string>();
     }
-    if (j.contains("run_at_startup")) {
-      m_runAtStartup = j["run_at_startup"].get<bool>();
-    }
     if (j.contains("minimize_to_tray")) {
       m_minimizeToTray = j["minimize_to_tray"].get<bool>();
     }
@@ -87,7 +84,6 @@ void ConfigManager::SaveActiveConfig() {
     j["mappings"][btn] = keyArray;
   }
   j["last_profile"] = m_loadedProfileName;
-  j["run_at_startup"] = m_runAtStartup;
   j["minimize_to_tray"] = m_minimizeToTray;
 
   std::ofstream file("active_config.json");
@@ -195,26 +191,6 @@ void ConfigManager::SetMappedKeys(const std::string &buttonName,
                                   const std::vector<WORD> &keys) {
   m_mappings[buttonName] = keys;
   SaveActiveConfig(); // Auto-save all changes to active_config.json
-}
-
-void ConfigManager::SetRunAtStartup(bool enable) {
-  m_runAtStartup = enable;
-  SaveActiveConfig();
-
-  HKEY hKey;
-  const char *path = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-  if (RegOpenKeyExA(HKEY_CURRENT_USER, path, 0, KEY_SET_VALUE, &hKey) ==
-      ERROR_SUCCESS) {
-    if (enable) {
-      char szPath[MAX_PATH];
-      GetModuleFileNameA(NULL, szPath, MAX_PATH);
-      RegSetValueExA(hKey, "WiimoteKeyMapApp", 0, REG_SZ, (BYTE *)szPath,
-                     (DWORD)strlen(szPath) + 1);
-    } else {
-      RegDeleteValueA(hKey, "WiimoteKeyMapApp");
-    }
-    RegCloseKey(hKey);
-  }
 }
 
 void ConfigManager::SetMinimizeToTray(bool enable) {
