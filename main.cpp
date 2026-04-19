@@ -15,6 +15,7 @@
 #include "OutputRouter.h"
 // Must come after windows.h (pulled in via ConfigManager.h)
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shellapi.h>
 
 #include "resource.h"
@@ -40,6 +41,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 NOTIFYICONDATAW g_nid = {sizeof(g_nid)};
 bool g_WindowVisible = true;
+static HWND g_hwnd = nullptr;
 
 void AddTrayIcon(HWND hWnd) {
   g_nid.cbSize = sizeof(NOTIFYICONDATAW);
@@ -113,6 +115,34 @@ void ShowTrayContextMenu(HWND hWnd) {
   DestroyMenu(hMenu);
 }
 
+// Returns the selected file path, or empty string if the user cancelled.
+static std::string ShowOpenFileDialog() {
+  char buf[MAX_PATH] = {};
+  OPENFILENAMEA ofn   = {};
+  ofn.lStructSize     = sizeof(ofn);
+  ofn.hwndOwner       = g_hwnd;
+  ofn.lpstrFilter     = "JSON Profile\0*.json\0All Files\0*.*\0";
+  ofn.lpstrFile       = buf;
+  ofn.nMaxFile        = MAX_PATH;
+  ofn.Flags           = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+  ofn.lpstrDefExt     = "json";
+  return GetOpenFileNameA(&ofn) ? buf : "";
+}
+
+static std::string ShowSaveFileDialog(const std::string &defaultName) {
+  char buf[MAX_PATH] = {};
+  strncpy_s(buf, defaultName.c_str(), MAX_PATH - 1);
+  OPENFILENAMEA ofn   = {};
+  ofn.lStructSize     = sizeof(ofn);
+  ofn.hwndOwner       = g_hwnd;
+  ofn.lpstrFilter     = "JSON Profile\0*.json\0All Files\0*.*\0";
+  ofn.lpstrFile       = buf;
+  ofn.nMaxFile        = MAX_PATH;
+  ofn.Flags           = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+  ofn.lpstrDefExt     = "json";
+  return GetSaveFileNameA(&ofn) ? buf : "";
+}
+
 // App State
 std::atomic<bool> g_appRunning{true};
 std::atomic<bool> g_isSearching{false};
@@ -182,13 +212,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
   ConfigManager::GetInstance().LoadActiveConfig();
 
   // Create application window
-  WNDCLASSEXW wc = {sizeof(wc),          CS_CLASSDC, WndProc, 0L,      0L,
-                    hInstance,           nullptr,    nullptr, nullptr, nullptr,
-                    L"WiimoteKeyMap UI", nullptr};
+  HICON hAppIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_ICON1));
+  WNDCLASSEXW wc = {sizeof(wc),          CS_CLASSDC, WndProc,    0L,         0L,
+                    hInstance,           hAppIcon,   nullptr,    nullptr,    nullptr,
+                    L"WiimoteKeyMap UI", hAppIcon};
   ::RegisterClassExW(&wc);
   HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"WiimoteKeyMapApp",
                               WS_OVERLAPPEDWINDOW, 100, 100, 620, 770, nullptr,
                               nullptr, wc.hInstance, nullptr);
+  g_hwnd = hwnd;
 
   if (!CreateDeviceD3D(hwnd)) {
     CleanupDeviceD3D();
@@ -282,21 +314,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     // 0. Top Menu Bar
     if (ImGui::BeginMainMenuBar()) {
-      if (ImGui::BeginMenu("Profiles")) {
-        std::string current =
-            ConfigManager::GetInstance().GetCurrentProfileName();
-        ImGui::BeginDisabled();
-        ImGui::MenuItem(current.c_str(), NULL, true);
-        ImGui::EndDisabled();
-        ImGui::Separator();
-        if (ImGui::MenuItem("Export Current Configuration")) {
-          ConfigManager::GetInstance().SaveProfile("Exported_" + current);
-        }
-        if (ImGui::MenuItem("Delete Current Profile", NULL, false,
-                            current != "default")) {
-          ConfigManager::GetInstance().DeleteProfile(current);
-          ConfigManager::GetInstance().LoadProfile("default");
-        }
+      if (ImGui::BeginMenu("Settings")) {
+        bool tray = ConfigManager::GetInstance().GetMinimizeToTray();
+        if (ImGui::MenuItem("Minimize to System Tray", NULL, &tray))
+          ConfigManager::GetInstance().SetMinimizeToTray(tray);
         ImGui::EndMenu();
       }
       ImGui::EndMainMenuBar();
@@ -355,7 +376,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     ImGui::SeparatorText("Profile Management");
 
-    // Profile management toolbar
     static char newProfileName[64] = "";
     auto profiles = ConfigManager::GetInstance().ListProfiles();
     std::string currentProfile =
@@ -363,23 +383,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     int currentIdx = 0;
     for (int i = 0; i < (int)profiles.size(); ++i) {
-      if (profiles[i] == currentProfile) {
-        currentIdx = i;
-        break;
-      }
+      if (profiles[i] == currentProfile) { currentIdx = i; break; }
     }
 
-    // Line 1: Active Template Selection & Delete
+    // Row 1: dropdown  |  Quick Save  |  Delete
     ImGui::AlignTextToFramePadding();
-    ImGui::Text("Active Template:");
+    ImGui::Text("Profile:");
     ImGui::SameLine();
-    ImGui::PushItemWidth(180);
+    ImGui::PushItemWidth(190);
     if (ImGui::BeginCombo("##profiles", profiles[currentIdx].c_str())) {
       for (int n = 0; n < (int)profiles.size(); n++) {
         const bool is_selected = (currentIdx == n);
-        if (ImGui::Selectable(profiles[n].c_str(), is_selected)) {
+        if (ImGui::Selectable(profiles[n].c_str(), is_selected))
           ConfigManager::GetInstance().LoadProfile(profiles[n]);
-        }
         if (is_selected)
           ImGui::SetItemDefaultFocus();
       }
@@ -388,30 +404,60 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     ImGui::PopItemWidth();
 
     ImGui::SameLine();
-    if (ImGui::Button("Delete Profile") && currentProfile != "default") {
+    if (ImGui::Button("Quick Save")) {
+      ConfigManager::GetInstance().SaveCurrentProfile();
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Overwrite \"%s\" with current mappings", currentProfile.c_str());
+
+    ImGui::SameLine();
+    ImGui::BeginDisabled(currentProfile == "default");
+    if (ImGui::Button("Delete")) {
       ConfigManager::GetInstance().DeleteProfile(currentProfile);
       ConfigManager::GetInstance().LoadProfile("default");
     }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Delete the currently selected profile template");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip(currentProfile == "default"
+                            ? "Cannot delete the default profile"
+                            : "Delete \"%s\"", currentProfile.c_str());
+    ImGui::EndDisabled();
 
-    // Line 2: New Template Creation
-    ImGui::AlignTextToFramePadding();
-    ImGui::Text("Save Current As:");
+    // Row 2: Import from file  |  Export to file
+    if (ImGui::Button("Import from File...")) {
+      std::string path = ShowOpenFileDialog();
+      if (!path.empty())
+        ConfigManager::GetInstance().LoadProfileFromPath(path);
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Load a profile JSON from anywhere on disk.\n"
+                        "It is copied into the profiles folder and becomes active.");
+
     ImGui::SameLine();
-    ImGui::PushItemWidth(180);
+    if (ImGui::Button("Export to File...")) {
+      std::string def = currentProfile + ".json";
+      std::string path = ShowSaveFileDialog(def);
+      if (!path.empty())
+        ConfigManager::GetInstance().SaveProfileToPath(path);
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Save current mappings to a JSON file of your choice.");
+
+    // Row 3: Save as new profile inside profiles/ dir
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Save as New:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(175);
     ImGui::InputText("##newname", newProfileName, IM_ARRAYSIZE(newProfileName));
     ImGui::PopItemWidth();
     ImGui::SameLine();
-    if (ImGui::Button("Export Profile")) {
+    if (ImGui::Button("Save")) {
       if (strlen(newProfileName) > 0) {
         ConfigManager::GetInstance().SaveProfile(newProfileName);
         newProfileName[0] = '\0';
       }
     }
     if (ImGui::IsItemHovered())
-      ImGui::SetTooltip(
-          "Export current mapping session to a new profile template");
+      ImGui::SetTooltip("Save current mappings as a new profile in the profiles folder.");
 
     ImGui::SeparatorText("Button Mappings");
 
@@ -635,10 +681,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
       }
     }
 
-    ImGui::Separator();
-    if (ImGui::Button("Quick Save (Current Session)", ImVec2(-1, 30))) {
-      ConfigManager::GetInstance().SaveActiveConfig();
-    }
     ImGui::End();
 
     // Rendering
@@ -792,13 +834,15 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     break;
   case WM_CLOSE:
-    // X button: hide to tray instead of exiting.
-    // The user can exit via the tray context menu.
-    ::ShowWindow(hWnd, SW_HIDE);
-    g_WindowVisible = false;
-    ShowNotification(L"WiimoteKeyMapApp",
-                     L"Running in the background. "
-                     L"Double-click the tray icon to restore.");
+    if (ConfigManager::GetInstance().GetMinimizeToTray()) {
+      ::ShowWindow(hWnd, SW_HIDE);
+      g_WindowVisible = false;
+      ShowNotification(L"WiimoteKeyMapApp",
+                       L"Running in the background. "
+                       L"Double-click the tray icon to restore.");
+    } else {
+      ::PostQuitMessage(0);
+    }
     return 0;
   case WM_DESTROY:
     ::PostQuitMessage(0);

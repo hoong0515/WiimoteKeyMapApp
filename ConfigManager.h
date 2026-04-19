@@ -16,9 +16,16 @@ public:
     void LoadActiveConfig(); // Loads from active_config.json
     void SaveActiveConfig(); // Saves to active_config.json (Auto-save)
 
-    void LoadProfile(const std::string& profileName);   // Loads profile into active config
-    void SaveProfile(const std::string& profileName);   // Exports active config to a profile
-    
+    void LoadProfile(const std::string& profileName);   // Load from profiles/ dir
+    void SaveProfile(const std::string& profileName);   // Save to profiles/ dir
+    void SaveCurrentProfile();                          // Quick-save to active profile
+
+    // File-dialog import/export: load/save to any absolute path.
+    // LoadProfileFromPath copies the file into profiles/ so it appears in the
+    // dropdown, then makes it the active profile.
+    bool LoadProfileFromPath(const std::string& filePath);
+    bool SaveProfileToPath(const std::string& filePath);
+
     bool GetMinimizeToTray() const { return m_minimizeToTray; }
     void SetMinimizeToTray(bool enable);
 

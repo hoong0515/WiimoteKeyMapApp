@@ -229,14 +229,15 @@ void Connection::RemoveStalePairings() {
 }
 
 bool Connection::ScanOnce() {
-  // Single BT inquiry cycle (~2.56 s).  Only looks for unknown (unpaired)
-  // devices — the opposite of PassiveConnect which relies on the HID list.
-  // Safe to call from any thread without holding m_connectionMutex.
+  // BT inquiry for unknown/new devices.
+  // cTimeoutMultiplier=4 (~5.12 s) matches the original ActiveSearchConnect
+  // timing, giving the user enough time to press SYNC and Windows enough time
+  // to load the HID driver after BluetoothSetServiceState.
   BLUETOOTH_DEVICE_SEARCH_PARAMS sp = {
       sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS),
       0, 0, 1, 0, // returnUnknown only
       1,          // issueInquiry
-      2,          // cTimeoutMultiplier — 2 × 1.28 s ≈ 2.56 s per cycle
+      4,          // cTimeoutMultiplier — 4 × 1.28 s ≈ 5.12 s
       NULL
   };
   BLUETOOTH_DEVICE_INFO di = {sizeof(BLUETOOTH_DEVICE_INFO)};
@@ -247,11 +248,19 @@ bool Connection::ScanOnce() {
   bool found = false;
   do {
     if (std::wstring(di.szName).find(L"Nintendo RVL-CNT-01") != std::wstring::npos) {
-      std::wcout << L"Wii Remote found via continuous scan: " << di.szName << std::endl;
+      std::wcout << L"Wii Remote found via scan: " << di.szName << std::endl;
       GUID hidGuid = HumanInterfaceDeviceServiceClass_UUID;
-      if (BluetoothSetServiceState(NULL, &di, &hidGuid, BLUETOOTH_SERVICE_ENABLE) == ERROR_SUCCESS) {
-        std::cout << "HID service enabled." << std::endl;
+      DWORD result = BluetoothSetServiceState(NULL, &di, &hidGuid, BLUETOOTH_SERVICE_ENABLE);
+      if (result == ERROR_SUCCESS) {
+        std::cout << "HID service enabled. Waiting for device path..." << std::endl;
+        // Windows loads the HID driver asynchronously after SetServiceState.
+        // Poll until the path appears (up to 5 s) — mirrors the polling loop
+        // that the original ActiveSearchConnect used before PassiveConnect.
+        for (int i = 0; i < 10 && FindWiimoteDevicePath().empty(); ++i)
+          Sleep(500);
         found = true;
+      } else {
+        std::cerr << "Failed to enable HID service. Error: " << result << std::endl;
       }
       break;
     }

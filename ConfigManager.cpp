@@ -150,6 +150,70 @@ void ConfigManager::SaveProfile(const std::string &profileName) {
   }
 }
 
+void ConfigManager::SaveCurrentProfile() {
+  SaveProfile(m_loadedProfileName);
+}
+
+bool ConfigManager::LoadProfileFromPath(const std::string &filePath) {
+  std::ifstream file(filePath);
+  if (!file.is_open())
+    return false;
+
+  try {
+    json j;
+    file >> j;
+    if (!j.contains("mappings"))
+      return false;
+
+    m_mappings.clear();
+    for (auto &[key, val] : j["mappings"].items()) {
+      std::vector<WORD> keys;
+      if (val.is_array()) {
+        for (auto &k : val)
+          keys.push_back(StringToVK(k.get<std::string>()));
+      } else if (val.is_string()) {
+        keys.push_back(StringToVK(val.get<std::string>()));
+      }
+      m_mappings[key] = keys;
+    }
+
+    // Derive profile name from filename and copy into profiles/ dir
+    std::string name = fs::path(filePath).stem().string();
+    std::string dest = "profiles/" + name + ".json";
+    try {
+      if (!fs::exists("profiles"))
+        fs::create_directory("profiles");
+      fs::copy_file(filePath, dest, fs::copy_options::overwrite_existing);
+    } catch (...) {
+    }
+
+    m_loadedProfileName = name;
+    SaveActiveConfig();
+    std::cout << "Loaded profile from file: " << filePath << std::endl;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ConfigManager::SaveProfileToPath(const std::string &filePath) {
+  json j;
+  for (const auto &[btn, keys] : m_mappings) {
+    json keyArray = json::array();
+    for (WORD vk : keys)
+      keyArray.push_back(VKToString(vk));
+    j["mappings"][btn] = keyArray;
+  }
+
+  std::ofstream file(filePath);
+  if (!file.is_open())
+    return false;
+
+  file << j.dump(4);
+  std::cout << "Saved profile to file: " << filePath << std::endl;
+  return true;
+}
+
 std::vector<std::string> ConfigManager::ListProfiles() const {
   std::vector<std::string> profiles;
   try {
